@@ -2,11 +2,13 @@ package conf
 
 import (
 	"encoding/json"
+	"strings"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/proxy/socks"
+	"google.golang.org/protobuf/proto"
 )
 
 type SocksAccount struct {
@@ -43,7 +45,7 @@ func (v *SocksServerConfig) Build() (proto.Message, error) {
 	case AuthMethodUserPass:
 		config.AuthType = socks.AuthType_PASSWORD
 	default:
-		// newError("unknown socks auth method: ", v.AuthMethod, ". Default to noauth.").AtWarning().WriteToLog()
+		// errors.New("unknown socks auth method: ", v.AuthMethod, ". Default to noauth.").AtWarning().WriteToLog()
 		config.AuthType = socks.AuthType_NO_AUTH
 	}
 
@@ -69,13 +71,25 @@ type SocksRemoteConfig struct {
 	Port    uint16            `json:"port"`
 	Users   []json.RawMessage `json:"users"`
 }
+
 type SocksClientConfig struct {
 	Servers []*SocksRemoteConfig `json:"servers"`
+	Version string               `json:"version"`
 }
 
 func (v *SocksClientConfig) Build() (proto.Message, error) {
 	config := new(socks.ClientConfig)
 	config.Server = make([]*protocol.ServerEndpoint, len(v.Servers))
+	switch strings.ToLower(v.Version) {
+	case "4":
+		config.Version = socks.Version_SOCKS4
+	case "4a":
+		config.Version = socks.Version_SOCKS4A
+	case "", "5":
+		config.Version = socks.Version_SOCKS5
+	default:
+		return nil, errors.New("failed to parse socks server version: ", v.Version).AtError()
+	}
 	for idx, serverConfig := range v.Servers {
 		server := &protocol.ServerEndpoint{
 			Address: serverConfig.Address.Build(),
@@ -84,11 +98,14 @@ func (v *SocksClientConfig) Build() (proto.Message, error) {
 		for _, rawUser := range serverConfig.Users {
 			user := new(protocol.User)
 			if err := json.Unmarshal(rawUser, user); err != nil {
-				return nil, newError("failed to parse Socks user").Base(err).AtError()
+				return nil, errors.New("failed to parse Socks user").Base(err).AtError()
 			}
 			account := new(SocksAccount)
 			if err := json.Unmarshal(rawUser, account); err != nil {
-				return nil, newError("failed to parse socks account").Base(err).AtError()
+				return nil, errors.New("failed to parse socks account").Base(err).AtError()
+			}
+			if config.Version != socks.Version_SOCKS5 && account.Password != "" {
+				return nil, errors.New("password is only supported in socks5").AtError()
 			}
 			user.Account = serial.ToTypedMessage(account.Build())
 			server.User = append(server.User, user)

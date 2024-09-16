@@ -7,18 +7,19 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
-
+	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
 	http_proto "github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/serial"
-	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/tls"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 type Listener struct {
@@ -26,7 +27,6 @@ type Listener struct {
 	handler internet.ConnHandler
 	local   net.Addr
 	config  *Config
-	locker  *internet.FileLocker // for unix domain socket
 }
 
 func (l *Listener) Addr() net.Addr {
@@ -34,9 +34,6 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) Close() error {
-	if l.locker != nil {
-		l.locker.Release()
-	}
 	return l.server.Close()
 }
 
@@ -50,8 +47,15 @@ func (fw flushWriter) Write(p []byte) (n int, err error) {
 		return 0, io.ErrClosedPipe
 	}
 
+	defer func() {
+		if recover() != nil {
+			fw.d.Close()
+			err = io.ErrClosedPipe
+		}
+	}()
+
 	n, err = fw.w.Write(p)
-	if f, ok := fw.w.(http.Flusher); ok {
+	if f, ok := fw.w.(http.Flusher); ok && err == nil {
 		f.Flush()
 	}
 	return
@@ -70,6 +74,13 @@ func (l *Listener) ServeHTTP(writer http.ResponseWriter, request *http.Request) 
 	}
 
 	writer.Header().Set("Cache-Control", "no-store")
+
+	for _, httpHeader := range l.config.Header {
+		for _, httpHeaderValue := range httpHeader.Value {
+			writer.Header().Set(httpHeader.Name, httpHeaderValue)
+		}
+	}
+
 	writer.WriteHeader(200)
 	if f, ok := writer.(http.Flusher); ok {
 		f.Flush()
@@ -78,7 +89,7 @@ func (l *Listener) ServeHTTP(writer http.ResponseWriter, request *http.Request) 
 	remoteAddr := l.Addr()
 	dest, err := net.ParseDestination(request.RemoteAddr)
 	if err != nil {
-		newError("failed to parse request remote addr: ", request.RemoteAddr).Base(err).WriteToLog()
+		errors.LogInfoInner(context.Background(), err, "failed to parse request remote addr: ", request.RemoteAddr)
 	} else {
 		remoteAddr = &net.TCPAddr{
 			IP:   dest.Address.IP(),
@@ -149,7 +160,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	}
 
 	if streamSettings.SocketSettings != nil && streamSettings.SocketSettings.AcceptProxyProtocol {
-		newError("accepting PROXY protocol").AtWarning().WriteToLog(session.ExportIDToError(ctx))
+		errors.LogWarning(ctx, "accepting PROXY protocol")
 	}
 
 	listener.server = server
@@ -162,12 +173,8 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 				Net:  "unix",
 			}, streamSettings.SocketSettings)
 			if err != nil {
-				newError("failed to listen on ", address).Base(err).AtError().WriteToLog(session.ExportIDToError(ctx))
+				errors.LogErrorInner(ctx, err, "failed to listen on ", address)
 				return
-			}
-			locker := ctx.Value(address.Domain())
-			if locker != nil {
-				listener.locker = locker.(*internet.FileLocker)
 			}
 		} else { // tcp
 			streamListener, err = internet.ListenSystem(ctx, &net.TCPAddr{
@@ -175,20 +182,23 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 				Port: int(port),
 			}, streamSettings.SocketSettings)
 			if err != nil {
-				newError("failed to listen on ", address, ":", port).Base(err).AtError().WriteToLog(session.ExportIDToError(ctx))
+				errors.LogErrorInner(ctx, err, "failed to listen on ", address, ":", port)
 				return
 			}
 		}
 
 		if config == nil {
+			if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
+				streamListener = goreality.NewListener(streamListener, config.GetREALITYConfig())
+			}
 			err = server.Serve(streamListener)
 			if err != nil {
-				newError("stopping serving H2C").Base(err).WriteToLog(session.ExportIDToError(ctx))
+				errors.LogInfoInner(ctx, err, "stopping serving H2C or REALITY H2")
 			}
 		} else {
 			err = server.ServeTLS(streamListener, "", "")
 			if err != nil {
-				newError("stopping serving TLS").Base(err).WriteToLog(session.ExportIDToError(ctx))
+				errors.LogInfoInner(ctx, err, "stopping serving TLS H2")
 			}
 		}
 	}()

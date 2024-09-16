@@ -10,8 +10,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"google.golang.org/grpc"
-
 	"github.com/xtls/xray-core/app/commander"
 	"github.com/xtls/xray-core/app/policy"
 	"github.com/xtls/xray-core/app/proxyman"
@@ -31,7 +29,83 @@ import (
 	"github.com/xtls/xray-core/proxy/vmess/inbound"
 	"github.com/xtls/xray-core/proxy/vmess/outbound"
 	"github.com/xtls/xray-core/testing/servers/tcp"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
+
+func TestCommanderListenConfigurationItem(t *testing.T) {
+	tcpServer := tcp.Server{
+		MsgProcessor: xor,
+	}
+	dest, err := tcpServer.Start()
+	common.Must(err)
+	defer tcpServer.Close()
+
+	clientPort := tcp.PickPort()
+	cmdPort := tcp.PickPort()
+	clientConfig := &core.Config{
+		App: []*serial.TypedMessage{
+			serial.ToTypedMessage(&commander.Config{
+				Tag:    "api",
+				Listen: fmt.Sprintf("127.0.0.1:%d", cmdPort),
+				Service: []*serial.TypedMessage{
+					serial.ToTypedMessage(&command.Config{}),
+				},
+			}),
+		},
+		Inbound: []*core.InboundHandlerConfig{
+			{
+				Tag: "d",
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
+				}),
+				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+					Address:  net.NewIPOrDomain(dest.Address),
+					Port:     uint32(dest.Port),
+					Networks: []net.Network{net.Network_TCP},
+				}),
+			},
+		},
+		Outbound: []*core.OutboundHandlerConfig{
+			{
+				Tag:           "default-outbound",
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+			},
+		},
+	}
+
+	servers, err := InitializeServerConfigs(clientConfig)
+	common.Must(err)
+	defer CloseAllServers(servers)
+
+	if err := testTCPConn(clientPort, 1024, time.Second*5)(); err != nil {
+		t.Fatal(err)
+	}
+
+	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	common.Must(err)
+	defer cmdConn.Close()
+
+	hsClient := command.NewHandlerServiceClient(cmdConn)
+	resp, err := hsClient.RemoveInbound(context.Background(), &command.RemoveInboundRequest{
+		Tag: "d",
+	})
+	common.Must(err)
+	if resp == nil {
+		t.Error("unexpected nil response")
+	}
+
+	{
+		_, err := net.DialTCP("tcp", nil, &net.TCPAddr{
+			IP:   []byte{127, 0, 0, 1},
+			Port: int(clientPort),
+		})
+		if err == nil {
+			t.Error("unexpected nil error")
+		}
+	}
+}
 
 func TestCommanderRemoveHandler(t *testing.T) {
 	tcpServer := tcp.Server{
@@ -66,8 +140,8 @@ func TestCommanderRemoveHandler(t *testing.T) {
 			{
 				Tag: "d",
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange: net.SinglePortRange(clientPort),
-					Listen:    net.NewIPOrDomain(net.LocalHostIP),
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
 					Address:  net.NewIPOrDomain(dest.Address),
@@ -78,8 +152,8 @@ func TestCommanderRemoveHandler(t *testing.T) {
 			{
 				Tag: "api",
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange: net.SinglePortRange(cmdPort),
-					Listen:    net.NewIPOrDomain(net.LocalHostIP),
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(cmdPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
 					Address:  net.NewIPOrDomain(dest.Address),
@@ -104,7 +178,7 @@ func TestCommanderRemoveHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithInsecure(), grpc.WithBlock())
+	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	common.Must(err)
 	defer cmdConn.Close()
 
@@ -174,15 +248,14 @@ func TestCommanderAddRemoveUser(t *testing.T) {
 			{
 				Tag: "v",
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange: net.SinglePortRange(serverPort),
-					Listen:    net.NewIPOrDomain(net.LocalHostIP),
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&inbound.Config{
 					User: []*protocol.User{
 						{
 							Account: serial.ToTypedMessage(&vmess.Account{
-								Id:      u1.String(),
-								AlterId: 64,
+								Id: u1.String(),
 							}),
 						},
 					},
@@ -191,8 +264,8 @@ func TestCommanderAddRemoveUser(t *testing.T) {
 			{
 				Tag: "api",
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange: net.SinglePortRange(cmdPort),
-					Listen:    net.NewIPOrDomain(net.LocalHostIP),
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(cmdPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
 					Address:  net.NewIPOrDomain(dest.Address),
@@ -226,8 +299,8 @@ func TestCommanderAddRemoveUser(t *testing.T) {
 			{
 				Tag: "d",
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange: net.SinglePortRange(clientPort),
-					Listen:    net.NewIPOrDomain(net.LocalHostIP),
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
 					Address: net.NewIPOrDomain(dest.Address),
@@ -248,8 +321,7 @@ func TestCommanderAddRemoveUser(t *testing.T) {
 							User: []*protocol.User{
 								{
 									Account: serial.ToTypedMessage(&vmess.Account{
-										Id:      u2.String(),
-										AlterId: 64,
+										Id: u2.String(),
 										SecuritySettings: &protocol.SecurityConfig{
 											Type: protocol.SecurityType_AES128_GCM,
 										},
@@ -273,7 +345,7 @@ func TestCommanderAddRemoveUser(t *testing.T) {
 		t.Fatal("expected error: ", err)
 	}
 
-	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithInsecure(), grpc.WithBlock())
+	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	common.Must(err)
 	defer cmdConn.Close()
 
@@ -285,8 +357,7 @@ func TestCommanderAddRemoveUser(t *testing.T) {
 				User: &protocol.User{
 					Email: "test@example.com",
 					Account: serial.ToTypedMessage(&vmess.Account{
-						Id:      u2.String(),
-						AlterId: 64,
+						Id: u2.String(),
 					}),
 				},
 			}),
@@ -367,8 +438,8 @@ func TestCommanderStats(t *testing.T) {
 			{
 				Tag: "vmess",
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange: net.SinglePortRange(serverPort),
-					Listen:    net.NewIPOrDomain(net.LocalHostIP),
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&inbound.Config{
 					User: []*protocol.User{
@@ -376,8 +447,7 @@ func TestCommanderStats(t *testing.T) {
 							Level: 1,
 							Email: "test",
 							Account: serial.ToTypedMessage(&vmess.Account{
-								Id:      userID.String(),
-								AlterId: 64,
+								Id: userID.String(),
 							}),
 						},
 					},
@@ -386,8 +456,8 @@ func TestCommanderStats(t *testing.T) {
 			{
 				Tag: "api",
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange: net.SinglePortRange(cmdPort),
-					Listen:    net.NewIPOrDomain(net.LocalHostIP),
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(cmdPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
 					Address: net.NewIPOrDomain(dest.Address),
@@ -410,8 +480,8 @@ func TestCommanderStats(t *testing.T) {
 		Inbound: []*core.InboundHandlerConfig{
 			{
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange: net.SinglePortRange(clientPort),
-					Listen:    net.NewIPOrDomain(net.LocalHostIP),
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
 					Address: net.NewIPOrDomain(dest.Address),
@@ -432,8 +502,7 @@ func TestCommanderStats(t *testing.T) {
 							User: []*protocol.User{
 								{
 									Account: serial.ToTypedMessage(&vmess.Account{
-										Id:      userID.String(),
-										AlterId: 64,
+										Id: userID.String(),
 										SecuritySettings: &protocol.SecurityConfig{
 											Type: protocol.SecurityType_AES128_GCM,
 										},
@@ -457,7 +526,7 @@ func TestCommanderStats(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithInsecure(), grpc.WithBlock())
+	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	common.Must(err)
 	defer cmdConn.Close()
 

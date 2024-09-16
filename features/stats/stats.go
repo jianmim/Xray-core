@@ -6,6 +6,7 @@ import (
 	"context"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/features"
 )
 
@@ -25,11 +26,11 @@ type Counter interface {
 //
 // xray:api:stable
 type Channel interface {
-	// Channel is a runnable unit.
+	// Runnable implies that Channel is a runnable unit.
 	common.Runnable
 	// Publish broadcasts a message through the channel with a controlling context.
 	Publish(context.Context, interface{})
-	// SubscriberCount returns the number of the subscribers.
+	// Subscribers returns all subscribers.
 	Subscribers() []chan interface{}
 	// Subscribe registers for listening to channel stream and returns a new listener channel.
 	Subscribe() (chan interface{}, error)
@@ -47,7 +48,7 @@ func SubscribeRunnableChannel(c Channel) (chan interface{}, error) {
 	return c.Subscribe()
 }
 
-// UnsubscribeClosableChannel unsubcribes the channel and close it if there is no more subscriber.
+// UnsubscribeClosableChannel unsubscribes the channel and close it if there is no more subscriber.
 func UnsubscribeClosableChannel(c Channel, sub chan interface{}) error {
 	if err := c.Unsubscribe(sub); err != nil {
 		return err
@@ -73,7 +74,7 @@ type Manager interface {
 
 	// RegisterChannel registers a new channel to the manager. The identifier string must not be empty, and unique among other channels.
 	RegisterChannel(string) (Channel, error)
-	// UnregisterCounter unregisters a channel from the manager by its identifier.
+	// UnregisterChannel unregisters a channel from the manager by its identifier.
 	UnregisterChannel(string) error
 	// GetChannel returns a channel by its identifier.
 	GetChannel(string) Channel
@@ -116,7 +117,7 @@ func (NoopManager) Type() interface{} {
 
 // RegisterCounter implements Manager.
 func (NoopManager) RegisterCounter(string) (Counter, error) {
-	return nil, newError("not implemented")
+	return nil, errors.New("not implemented")
 }
 
 // UnregisterCounter implements Manager.
@@ -131,7 +132,7 @@ func (NoopManager) GetCounter(string) Counter {
 
 // RegisterChannel implements Manager.
 func (NoopManager) RegisterChannel(string) (Channel, error) {
-	return nil, newError("not implemented")
+	return nil, errors.New("not implemented")
 }
 
 // UnregisterChannel implements Manager.

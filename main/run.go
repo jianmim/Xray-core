@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
@@ -11,9 +10,13 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/xtls/xray-core/common/cmdarg"
+	"github.com/xtls/xray-core/common/errors"
+	clog "github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/main/commands/base"
@@ -31,28 +34,30 @@ Xray. Multiple assign is accepted.
 The -confdir=dir flag sets a dir with multiple json config
 
 The -format=json flag sets the format of config files. 
-Default "json".
+Default "auto".
 
 The -test flag tells Xray to test config files only, 
-without launching the server
+without launching the server.
+
+The -dump flag tells Xray to print the merged config.
 	`,
 }
 
 func init() {
-	cmdRun.Run = executeRun //break init loop
+	cmdRun.Run = executeRun // break init loop
 }
 
 var (
 	configFiles cmdarg.Arg // "Config file for Xray.", the option is customed type, parse in main
 	configDir   string
+	dump        = cmdRun.Flag.Bool("dump", false, "Dump merged config only, without launching Xray server.")
 	test        = cmdRun.Flag.Bool("test", false, "Test config file only, without launching Xray server.")
-	format      = cmdRun.Flag.String("format", "json", "Format of input file.")
+	format      = cmdRun.Flag.String("format", "auto", "Format of input file.")
 
 	/* We have to do this here because Golang's Test will also need to parse flag, before
 	 * main func in this file is run.
 	 */
 	_ = func() bool {
-
 		cmdRun.Flag.Var(&configFiles, "config", "Config path for Xray.")
 		cmdRun.Flag.Var(&configFiles, "c", "Short alias of -config")
 		cmdRun.Flag.StringVar(&configDir, "confdir", "", "A dir with multiple json config")
@@ -62,6 +67,12 @@ var (
 )
 
 func executeRun(cmd *base.Command, args []string) {
+	if *dump {
+		clog.ReplaceWithSeverityLogger(clog.Severity_Warning)
+		errCode := dumpConfig()
+		os.Exit(errCode)
+	}
+
 	printVersion()
 	server, err := startXray()
 	if err != nil {
@@ -98,6 +109,18 @@ func executeRun(cmd *base.Command, args []string) {
 	}
 }
 
+func dumpConfig() int {
+	files := getConfigFilePath(false)
+	if config, err := core.GetMergedConfig(files); err != nil {
+		fmt.Println(err)
+		time.Sleep(1 * time.Second)
+		return 23
+	} else {
+		fmt.Print(config)
+	}
+	return 0
+}
+
 func fileExists(file string) bool {
 	info, err := os.Stat(file)
 	return err == nil && !info.IsDir()
@@ -111,13 +134,26 @@ func dirExists(file string) bool {
 	return err == nil && info.IsDir()
 }
 
+func getRegepxByFormat() string {
+	switch strings.ToLower(*format) {
+	case "json":
+		return `^.+\.(json|jsonc)$`
+	case "toml":
+		return `^.+\.toml$`
+	case "yaml", "yml":
+		return `^.+\.(yaml|yml)$`
+	default:
+		return `^.+\.(json|jsonc|toml|yaml|yml)$`
+	}
+}
+
 func readConfDir(dirPath string) {
-	confs, err := ioutil.ReadDir(dirPath)
+	confs, err := os.ReadDir(dirPath)
 	if err != nil {
 		log.Fatalln(err)
 	}
 	for _, f := range confs {
-		matched, err := regexp.MatchString(`^.+\.(json|toml|yaml|yml)$`, f.Name())
+		matched, err := regexp.MatchString(getRegepxByFormat(), f.Name())
 		if err != nil {
 			log.Fatalln(err)
 		}
@@ -127,12 +163,16 @@ func readConfDir(dirPath string) {
 	}
 }
 
-func getConfigFilePath() cmdarg.Arg {
+func getConfigFilePath(verbose bool) cmdarg.Arg {
 	if dirExists(configDir) {
-		log.Println("Using confdir from arg:", configDir)
+		if verbose {
+			log.Println("Using confdir from arg:", configDir)
+		}
 		readConfDir(configDir)
 	} else if envConfDir := platform.GetConfDirPath(); dirExists(envConfDir) {
-		log.Println("Using confdir from env:", envConfDir)
+		if verbose {
+			log.Println("Using confdir from env:", envConfDir)
+		}
 		readConfDir(envConfDir)
 	}
 
@@ -143,42 +183,47 @@ func getConfigFilePath() cmdarg.Arg {
 	if workingDir, err := os.Getwd(); err == nil {
 		configFile := filepath.Join(workingDir, "config.json")
 		if fileExists(configFile) {
-			log.Println("Using default config: ", configFile)
+			if verbose {
+				log.Println("Using default config: ", configFile)
+			}
 			return cmdarg.Arg{configFile}
 		}
 	}
 
 	if configFile := platform.GetConfigurationPath(); fileExists(configFile) {
-		log.Println("Using config from env: ", configFile)
+		if verbose {
+			log.Println("Using config from env: ", configFile)
+		}
 		return cmdarg.Arg{configFile}
 	}
 
-	log.Println("Using config from STDIN")
+	if verbose {
+		log.Println("Using config from STDIN")
+	}
 	return cmdarg.Arg{"stdin:"}
 }
 
 func getConfigFormat() string {
 	f := core.GetFormatByExtension(*format)
 	if f == "" {
-		f = "json"
+		f = "auto"
 	}
 	return f
 }
 
 func startXray() (core.Server, error) {
-	configFiles := getConfigFilePath()
+	configFiles := getConfigFilePath(true)
 
-	//config, err := core.LoadConfig(getConfigFormat(), configFiles[0], configFiles)
+	// config, err := core.LoadConfig(getConfigFormat(), configFiles[0], configFiles)
 
 	c, err := core.LoadConfig(getConfigFormat(), configFiles)
-
 	if err != nil {
-		return nil, newError("failed to load config files: [", configFiles.String(), "]").Base(err)
+		return nil, errors.New("failed to load config files: [", configFiles.String(), "]").Base(err)
 	}
 
 	server, err := core.New(c)
 	if err != nil {
-		return nil, newError("failed to create server").Base(err)
+		return nil, errors.New("failed to create server").Base(err)
 	}
 
 	return server, nil
